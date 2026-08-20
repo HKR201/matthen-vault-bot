@@ -1,0 +1,331 @@
+import os
+import io
+import asyncio
+import logging
+import zipfile
+import bcrypt
+import exifread
+from datetime import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from supabase import create_client, Client
+from google import genai
+from PIL import Image
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+CHANNEL_1_ID = int(os.getenv("CHANNEL_1_ID", "0"))
+CHANNEL_2_ID = int(os.getenv("CHANNEL_2_ID", "0"))
+CHANNEL_3_ID = int(os.getenv("CHANNEL_3_ID", "0"))
+CHANNEL_4_ID = int(os.getenv("CHANNEL_4_ID", "0"))
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+ai_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+scheduler = AsyncIOScheduler()
+
+class Form(StatesGroup):
+    waiting_for_nickname = State()
+    waiting_for_channel4_pin = State()
+    waiting_for_new_pin = State()
+
+def extract_exif_metadata(image_bytes: bytes):
+    year = None
+    location = "Unknown"
+    try:
+        tags = exifread.process_file(io.BytesIO(image_bytes), details=False)
+        date_str = tags.get('EXIF DateTimeOriginal') or tags.get('Image DateTime')
+        if date_str:
+            year = int(str(date_str).split(':')[0])
+    except Exception as e:
+        logger.error(f"EXIF parsing error: {e}")
+    return year, location
+
+async def analyze_photo_with_gemini(image_bytes: bytes):
+    if not ai_client:
+        return "General", None
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        prompt = (
+            "Analyze this family photo. Return ONLY a comma-separated format: "
+            "Category (e.g. Nature, Landscape, Portrait, Document, Event), PersonTag (or None). "
+            "Example: Portrait, Family"
+        )
+        response = await asyncio.to_thread(
+            ai_client.models.generate_content,
+            model="gemini-2.5-flash",
+            contents=[img, prompt]
+        )
+        text = response.text.strip()
+        parts = [p.strip() for p in text.split(",")]
+        category = parts[0] if len(parts) > 0 else "General"
+        person_tag = parts[1] if len(parts) > 1 and parts[1].lower() != "none" else None
+        return category, person_tag
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        return "General", None
+
+async def daily_backup_task():
+    try:
+        tables = ["users", "files", "tags", "file_tags", "system_settings"]
+        backup_data = {}
+        for t in tables:
+            res = supabase.table(t).select("*").execute()
+            backup_data[f"{t}.json"] = str(res.data)
+
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for fname, content in backup_data.items():
+                zip_file.writestr(fname, content)
+        zip_buffer.seek(0)
+
+        doc = BufferedInputFile(zip_buffer.getvalue(), filename=f"backup_{datetime.now().strftime('%Y%m%d')}.zip")
+        await bot.send_document(chat_id=CHANNEL_3_ID, document=doc, caption="📦 Automated Daily Database Backup")
+        logger.info("Daily backup completed successfully.")
+    except Exception as e:
+        logger.error(f"Backup failed: {e}")
+
+@dp.message(CommandStart())
+async def start_handler(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    res = supabase.table("users").select("*").eq("telegram_id", user_id).execute()
+    
+    if not res.data:
+        await message.answer("မင်္ဂလာပါ! Vault Bot မှ ကြိုဆိုပါတယ်။\nသင့်ရဲ့ အမည်ပြောင် (Nickname - ဥပမာ: ဖေဖေ၊ မေမေ) ကို ရိုက်ထည့်ပေးပါ:")
+        await state.set_state(Form.waiting_for_nickname)
+    else:
+        user = res.data[0]
+        await message.answer(f"ကြိုဆိုပါတယ် {user['nickname']}!\nဖိုင်များ ရှာဖွေရန် /search ကို နှိပ်ပါ သို့မဟုတ် ဖိုင်များကို တိုက်ရိုက် ပေးပို့နိုင်ပါသည်။")
+
+@dp.message(Form.waiting_for_nickname)
+async def process_nickname(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    nickname = message.text.strip()
+    role = "ADMIN" if user_id == ADMIN_USER_ID else "MEMBER"
+    
+    supabase.table("users").insert({
+        "telegram_id": user_id,
+        "nickname": nickname,
+        "role": role,
+        "is_whitelisted": True
+    }).execute()
+    
+    await state.clear()
+    await message.answer(f"မှတ်တမ်းတင်ပြီးပါပြီ {nickname}! အသုံးပြုနိုင်ပါပြီ။")
+
+@dp.message(F.photo | F.video | F.document)
+async def handle_media_upload(message: types.Message):
+    user_id = message.from_user.id
+    caption = message.caption or ""
+    tags_list = [t for t in caption.split() if t.startswith("#")]
+    
+    if "#private" in caption or "#hide" in caption:
+        f_msg = await message.forward(chat_id=CHANNEL_4_ID)
+        file_id = message.photo[-1].file_id if message.photo else (message.video.file_id if message.video else message.document.file_id)
+        f_type = "PHOTO" if message.photo else ("VIDEO" if message.video else "DOCUMENT")
+        
+        supabase.table("files").insert({
+            "telegram_file_id": file_id,
+            "telegram_message_id": f_msg.message_id,
+            "vault_channel": "CHANNEL_4",
+            "file_type": f_type,
+            "uploader_id": user_id,
+            "access_level": "SUPER_PRIVATE",
+            "is_super_private": True
+        }).execute()
+        await message.reply("🔒 Super-Private Vault (Channel 4) ထဲသို့ လုံခြုံစွာ သိမ်းဆည်းလိုက်ပါပြီ။")
+        return
+
+    is_doc = message.document or any(t in caption for t in ["#စာချုပ်", "#doc", "#နယ်", "#ရွာ"])
+    if is_doc:
+        f_msg = await message.forward(chat_id=CHANNEL_3_ID)
+        file_id = message.document.file_id if message.document else (message.photo[-1].file_id if message.photo else message.video.file_id)
+        
+        res = supabase.table("files").insert({
+            "telegram_file_id": file_id,
+            "telegram_message_id": f_msg.message_id,
+            "vault_channel": "CHANNEL_3",
+            "file_type": "DOCUMENT",
+            "uploader_id": user_id,
+            "access_level": "SHARED"
+        }).execute()
+        
+        if res.data and tags_list:
+            file_uuid = res.data[0]['id']
+            for tag in tags_list:
+                tag_record = supabase.table("tags").upsert({"tag_name": tag}, on_conflict="tag_name").execute()
+                tag_id = tag_record.data[0]['id']
+                supabase.table("file_tags").insert({"file_id": file_uuid, "tag_id": tag_id}).execute()
+                
+        await message.reply("📄 Docs & System Vault (Channel 3) ထဲသို့ သိမ်းဆည်းပြီး Tag တွဲပေးလိုက်ပါပြီ။")
+        return
+
+    if message.video:
+        f_msg = await message.forward(chat_id=CHANNEL_2_ID)
+        supabase.table("files").insert({
+            "telegram_file_id": message.video.file_id,
+            "telegram_message_id": f_msg.message_id,
+            "vault_channel": "CHANNEL_2",
+            "file_type": "VIDEO",
+            "uploader_id": user_id,
+            "year": datetime.now().year,
+            "access_level": "SHARED"
+        }).execute()
+        await message.reply("🎥 Videos Vault (Channel 2) ထဲသို့ သိမ်းဆည်းလိုက်ပါပြီ။")
+        return
+
+    if message.photo:
+        f_msg = await message.forward(chat_id=CHANNEL_1_ID)
+        photo = message.photo[-1]
+        file_info = await bot.get_file(photo.file_id)
+        file_bytes = await bot.download_file(file_info.file_path)
+        img_bytes = file_bytes.read()
+
+        year, location = extract_exif_metadata(img_bytes)
+        year = year or datetime.now().year
+        category, person_tag = await analyze_photo_with_gemini(img_bytes)
+
+        supabase.table("files").insert({
+            "telegram_file_id": photo.file_id,
+            "telegram_message_id": f_msg.message_id,
+            "vault_channel": "CHANNEL_1",
+            "file_type": "PHOTO",
+            "uploader_id": user_id,
+            "year": year,
+            "location": location,
+            "ai_category": category,
+            "person_tag": person_tag,
+            "access_level": "SHARED"
+        }).execute()
+        await message.reply(f"📷 Photos Vault ထဲသို့ သိမ်းဆည်းပြီးပါပြီ။\n🏷️ AI Category: {category}")
+
+@dp.message(Command("search"))
+async def search_root_handler(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📷 ဓာတ်ပုံများ", callback_data="search_photos"),
+            InlineKeyboardButton(text="🎥 ဗီဒီယိုများ", callback_data="search_videos")
+        ],
+        [
+            InlineKeyboardButton(text="📄 စာချုပ်စာတမ်းများ", callback_data="search_docs"),
+            InlineKeyboardButton(text="🔒 Channel 4 Vault", callback_data="unlock_ch4")
+        ]
+    ])
+    await message.answer("ရှာဖွေလိုသော အုပ်စုကို ရွေးချယ်ပါ:", reply_markup=kb)
+
+@dp.callback_query(F.data == "search_photos")
+async def search_photos_drilldown(callback: types.CallbackQuery):
+    years_res = supabase.table("files").select("year").eq("vault_channel", "CHANNEL_1").execute()
+    years = sorted(list(set(r['year'] for r in years_res.data if r.get('year'))))
+    
+    kb_buttons = [[InlineKeyboardButton(text=f"📅 {y}", callback_data=f"filter_year_{y}")] for y in years]
+    await callback.message.edit_text("ခုနှစ်အလိုက် ရှာဖွေပါ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+
+@dp.callback_query(F.data.startswith("filter_year_"))
+async def show_files_by_year(callback: types.CallbackQuery):
+    year = int(callback.data.split("_")[2])
+    res = supabase.table("files").select("*").eq("vault_channel", "CHANNEL_1").eq("year", year).limit(5).execute()
+    
+    if not res.data:
+        await callback.answer("ဖိုင်မရှိသေးပါခင်ဗျာ။", show_alert=True)
+        return
+        
+    for item in res.data:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬇️ Download Original", callback_data=f"getraw_{item['id']}")]
+        ])
+        await bot.send_photo(
+            chat_id=callback.from_user.id,
+            photo=item['telegram_file_id'],
+            caption=f"📅 Year: {item['year']} | 🏷️ {item.get('ai_category', 'General')}",
+            reply_markup=kb
+        )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("getraw_"))
+async def stream_raw_file(callback: types.CallbackQuery):
+    file_uuid = callback.data.split("_")[1]
+    res = supabase.table("files").select("*").eq("id", file_uuid).execute()
+    if res.data:
+        f = res.data[0]
+        channel_id = globals().get(f"{f['vault_channel']}_ID")
+        await bot.copy_message(
+            chat_id=callback.from_user.id,
+            from_chat_id=channel_id,
+            message_id=f['telegram_message_id']
+        )
+    await callback.answer()
+
+@dp.callback_query(F.data == "unlock_ch4")
+async def prompt_ch4_pin(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("🔒 Super-Private Vault PIN ရိုက်ထည့်ပေးပါ:")
+    await state.set_state(Form.waiting_for_channel4_pin)
+    await callback.answer()
+
+@dp.message(Form.waiting_for_channel4_pin)
+async def verify_ch4_pin(message: types.Message, state: FSMContext):
+    entered_pin = message.text.strip()
+    await message.delete()
+
+    res = supabase.table("system_settings").select("key_value_hash").eq("key_name", "CH4_MASTER_PIN").execute()
+    if not res.data:
+        await message.answer("⚠️ Master PIN မသတ်မှတ်ရသေးပါ။ Admin ထံ /setpin ဖြင့် PIN အသစ် သတ်မှတ်ခိုင်းပါ။")
+        await state.clear()
+        return
+
+    stored_hash = res.data[0]['key_value_hash'].encode('utf-8')
+    if bcrypt.checkpw(entered_pin.encode('utf-8'), stored_hash):
+        files_res = supabase.table("files").select("*").eq("vault_channel", "CHANNEL_4").execute()
+        await message.answer(f"🔓 PIN မှန်ကန်ပါသည်။ Channel 4 တွင် ဖိုင်စုစုပေါင်း {len(files_res.data)} ခု ရှိပါသည်။")
+    else:
+        await message.answer("❌ PIN မှားယွင်းနေပါသည်။")
+    await state.clear()
+
+@dp.message(Command("setpin"))
+async def set_new_pin(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_USER_ID:
+        await message.reply("Admin သာလျှင် PIN သတ်မှတ်ခွင့်ရှိသည်။")
+        return
+    await message.answer("PIN အသစ် ရိုက်ထည့်ပေးပါ:")
+    await state.set_state(Form.waiting_for_new_pin)
+
+@dp.message(Form.waiting_for_new_pin)
+async def save_new_pin(message: types.Message, state: FSMContext):
+    new_pin = message.text.strip()
+    await message.delete()
+    hashed = bcrypt.hashpw(new_pin.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    
+    supabase.table("system_settings").upsert({
+        "key_name": "CH4_MASTER_PIN",
+        "key_value_hash": hashed,
+        "updated_by": message.from_user.id
+    }).execute()
+    
+    await message.answer("✅ Channel 4 Master PIN အသစ်ကို လုံခြုံစွာ သတ်မှတ်သိမ်းဆည်းလိုက်ပါပြီ။")
+    await state.clear()
+
+async def main():
+    scheduler.add_job(daily_backup_task, "cron", hour=2, minute=0)
+    scheduler.start()
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Matthen Vault Bot is starting...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+  
