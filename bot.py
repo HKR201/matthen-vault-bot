@@ -7,6 +7,7 @@ import bcrypt
 import exifread
 from datetime import datetime
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
@@ -18,15 +19,16 @@ from supabase import create_client, Client
 from google import genai
 from PIL import Image
 
+# ----------------- LOGGING & CONFIG -----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-CHANNEL_1_ID = int(os.getenv("CHANNEL_1_ID", "0"))
-CHANNEL_2_ID = int(os.getenv("CHANNEL_2_ID", "0"))
-CHANNEL_3_ID = int(os.getenv("CHANNEL_3_ID", "0"))
-CHANNEL_4_ID = int(os.getenv("CHANNEL_4_ID", "0"))
+CHANNEL_1_ID = int(os.getenv("CHANNEL_1_ID", "0"))  # Photos Vault
+CHANNEL_2_ID = int(os.getenv("CHANNEL_2_ID", "0"))  # Videos Vault
+CHANNEL_3_ID = int(os.getenv("CHANNEL_3_ID", "0"))  # Docs Vault
+CHANNEL_4_ID = int(os.getenv("CHANNEL_4_ID", "0"))  # Super-Private Vault
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -39,11 +41,13 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
 
+# ----------------- FSM STATES -----------------
 class Form(StatesGroup):
     waiting_for_nickname = State()
     waiting_for_channel4_pin = State()
     waiting_for_new_pin = State()
 
+# ----------------- HELPER FUNCTIONS -----------------
 def extract_exif_metadata(image_bytes: bytes):
     year = None
     location = "Unknown"
@@ -80,6 +84,7 @@ async def analyze_photo_with_gemini(image_bytes: bytes):
         logger.error(f"Gemini API error: {e}")
         return "General", None
 
+# ----------------- BACKUP TASK -----------------
 async def daily_backup_task():
     try:
         tables = ["users", "files", "tags", "file_tags", "system_settings"]
@@ -100,6 +105,7 @@ async def daily_backup_task():
     except Exception as e:
         logger.error(f"Backup failed: {e}")
 
+# ----------------- HANDLERS: ONBOARDING -----------------
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
@@ -128,12 +134,14 @@ async def process_nickname(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(f"မှတ်တမ်းတင်ပြီးပါပြီ {nickname}! အသုံးပြုနိုင်ပါပြီ။")
 
+# ----------------- HANDLERS: INGESTION ROUTING -----------------
 @dp.message(F.photo | F.video | F.document)
 async def handle_media_upload(message: types.Message):
     user_id = message.from_user.id
     caption = message.caption or ""
     tags_list = [t for t in caption.split() if t.startswith("#")]
     
+    # 1. Super-Private Check (#private / #hide)
     if "#private" in caption or "#hide" in caption:
         f_msg = await message.forward(chat_id=CHANNEL_4_ID)
         file_id = message.photo[-1].file_id if message.photo else (message.video.file_id if message.video else message.document.file_id)
@@ -151,6 +159,7 @@ async def handle_media_upload(message: types.Message):
         await message.reply("🔒 Super-Private Vault (Channel 4) ထဲသို့ လုံခြုံစွာ သိမ်းဆည်းလိုက်ပါပြီ။")
         return
 
+    # 2. Documents & Contracts
     is_doc = message.document or any(t in caption for t in ["#စာချုပ်", "#doc", "#နယ်", "#ရွာ"])
     if is_doc:
         f_msg = await message.forward(chat_id=CHANNEL_3_ID)
@@ -175,6 +184,7 @@ async def handle_media_upload(message: types.Message):
         await message.reply("📄 Docs & System Vault (Channel 3) ထဲသို့ သိမ်းဆည်းပြီး Tag တွဲပေးလိုက်ပါပြီ။")
         return
 
+    # 3. Videos
     if message.video:
         f_msg = await message.forward(chat_id=CHANNEL_2_ID)
         supabase.table("files").insert({
@@ -189,6 +199,7 @@ async def handle_media_upload(message: types.Message):
         await message.reply("🎥 Videos Vault (Channel 2) ထဲသို့ သိမ်းဆည်းလိုက်ပါပြီ။")
         return
 
+    # 4. Standard Photos
     if message.photo:
         f_msg = await message.forward(chat_id=CHANNEL_1_ID)
         photo = message.photo[-1]
@@ -214,6 +225,7 @@ async def handle_media_upload(message: types.Message):
         }).execute()
         await message.reply(f"📷 Photos Vault ထဲသို့ သိမ်းဆည်းပြီးပါပြီ။\n🏷️ AI Category: {category}")
 
+# ----------------- HANDLERS: SEARCH & BROWSE -----------------
 @dp.message(Command("search"))
 async def search_root_handler(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -271,6 +283,7 @@ async def stream_raw_file(callback: types.CallbackQuery):
         )
     await callback.answer()
 
+# ----------------- HANDLERS: CHANNEL 4 PIN SECURITY -----------------
 @dp.callback_query(F.data == "unlock_ch4")
 async def prompt_ch4_pin(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("🔒 Super-Private Vault PIN ရိုက်ထည့်ပေးပါ:")
@@ -319,13 +332,27 @@ async def save_new_pin(message: types.Message, state: FSMContext):
     await message.answer("✅ Channel 4 Master PIN အသစ်ကို လုံခြုံစွာ သတ်မှတ်သိမ်းဆည်းလိုက်ပါပြီ။")
     await state.clear()
 
+# ----------------- MAIN RUNNER & DUMMY SERVER -----------------
+async def handle_ping(request):
+    return web.Response(text="Matthen Vault Bot is alive and running 24/7!")
+
 async def main():
     scheduler.add_job(daily_backup_task, "cron", hour=2, minute=0)
     scheduler.start()
+
+    # Render Web Service အတွက် Port နားထောင်ပေးခြင်း
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("Matthen Vault Bot is starting...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-  
+    
