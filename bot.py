@@ -14,21 +14,26 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.types import (
+    InlineKeyboardMarkup, 
+    InlineKeyboardButton, 
+    BufferedInputFile,
+    BotCommand,
+    BotCommandScopeDefault
+)
 from supabase import create_client, Client
 from google import genai
 from PIL import Image
 
-# ----------------- LOGGING & CONFIG -----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-CHANNEL_1_ID = int(os.getenv("CHANNEL_1_ID", "0"))  # Photos Vault
-CHANNEL_2_ID = int(os.getenv("CHANNEL_2_ID", "0"))  # Videos Vault
-CHANNEL_3_ID = int(os.getenv("CHANNEL_3_ID", "0"))  # Docs Vault
-CHANNEL_4_ID = int(os.getenv("CHANNEL_4_ID", "0"))  # Super-Private Vault
+CHANNEL_1_ID = int(os.getenv("CHANNEL_1_ID", "0"))
+CHANNEL_2_ID = int(os.getenv("CHANNEL_2_ID", "0"))
+CHANNEL_3_ID = int(os.getenv("CHANNEL_3_ID", "0"))
+CHANNEL_4_ID = int(os.getenv("CHANNEL_4_ID", "0"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -41,13 +46,11 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 scheduler = AsyncIOScheduler()
 
-# ----------------- FSM STATES -----------------
 class Form(StatesGroup):
     waiting_for_nickname = State()
     waiting_for_channel4_pin = State()
     waiting_for_new_pin = State()
 
-# ----------------- HELPER FUNCTIONS -----------------
 def extract_exif_metadata(image_bytes: bytes):
     year = None
     location = "Unknown"
@@ -57,7 +60,7 @@ def extract_exif_metadata(image_bytes: bytes):
         if date_str:
             year = int(str(date_str).split(':')[0])
     except Exception as e:
-        logger.error(f"EXIF parsing error: {e}")
+        logger.error(f"EXIF error: {e}")
     return year, location
 
 async def analyze_photo_with_gemini(image_bytes: bytes):
@@ -66,7 +69,7 @@ async def analyze_photo_with_gemini(image_bytes: bytes):
     try:
         img = Image.open(io.BytesIO(image_bytes))
         prompt = (
-            "Analyze this family photo. Return ONLY a comma-separated format: "
+            "Analyze this family photo. Return ONLY two values comma-separated: "
             "Category (e.g. Nature, Landscape, Portrait, Document, Event), PersonTag (or None). "
             "Example: Portrait, Family"
         )
@@ -84,7 +87,6 @@ async def analyze_photo_with_gemini(image_bytes: bytes):
         logger.error(f"Gemini API error: {e}")
         return "General", None
 
-# ----------------- BACKUP TASK -----------------
 async def daily_backup_task():
     try:
         tables = ["users", "files", "tags", "file_tags", "system_settings"]
@@ -101,22 +103,29 @@ async def daily_backup_task():
 
         doc = BufferedInputFile(zip_buffer.getvalue(), filename=f"backup_{datetime.now().strftime('%Y%m%d')}.zip")
         await bot.send_document(chat_id=CHANNEL_3_ID, document=doc, caption="📦 Automated Daily Database Backup")
-        logger.info("Daily backup completed successfully.")
+        logger.info("Backup uploaded to Channel 3.")
     except Exception as e:
         logger.error(f"Backup failed: {e}")
 
-# ----------------- HANDLERS: ONBOARDING -----------------
+# ----------------- ONBOARDING & MENU -----------------
 @dp.message(CommandStart())
 async def start_handler(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     res = supabase.table("users").select("*").eq("telegram_id", user_id).execute()
     
     if not res.data:
-        await message.answer("မင်္ဂလာပါ! Vault Bot မှ ကြိုဆိုပါတယ်။\nသင့်ရဲ့ အမည်ပြောင် (Nickname - ဥပမာ: ဖေဖေ၊ မေမေ) ကို ရိုက်ထည့်ပေးပါ:")
+        await message.answer("မင်္ဂလာပါ! Matthen Vault Bot မှ ကြိုဆိုပါတယ်။\nသင့်ရဲ့ အမည်ပြောင် (Nickname - ဥပမာ: ဖေဖေ၊ မေမေ) ကို ရိုက်ထည့်ပေးပါ:")
         await state.set_state(Form.waiting_for_nickname)
     else:
         user = res.data[0]
-        await message.answer(f"ကြိုဆိုပါတယ် {user['nickname']}!\nဖိုင်များ ရှာဖွေရန် /search ကို နှိပ်ပါ သို့မဟုတ် ဖိုင်များကို တိုက်ရိုက် ပေးပို့နိုင်ပါသည်။")
+        await message.answer(
+            f"ကြိုဆိုပါတယ် {user['nickname']}!\n\n"
+            "အောက်ပါ လုပ်ဆောင်ချက်များကို Menu မှတစ်ဆင့် သုံးနိုင်ပါသည်:\n"
+            "🔍 /search - ဖိုင်များ ပြန်လည်ရှာဖွေရန်\n"
+            "🏷️ /tags - စာချုပ် Tags များ ကြည့်ရန်\n"
+            "🔑 /setpin - Channel 4 PIN သတ်မှတ်ရန် (Admin Only)\n\n"
+            "ပုံ/ဗီဒီယို/စာရွက်စာတမ်းများကို မူရင်းအတိုင်း တိုက်ရိုက် ပေးပို့သိမ်းဆည်းနိုင်ပါသည်။"
+        )
 
 @dp.message(Form.waiting_for_nickname)
 async def process_nickname(message: types.Message, state: FSMContext):
@@ -134,14 +143,14 @@ async def process_nickname(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(f"မှတ်တမ်းတင်ပြီးပါပြီ {nickname}! အသုံးပြုနိုင်ပါပြီ။")
 
-# ----------------- HANDLERS: INGESTION ROUTING -----------------
+# ----------------- INGESTION ENGINE -----------------
 @dp.message(F.photo | F.video | F.document)
 async def handle_media_upload(message: types.Message):
     user_id = message.from_user.id
     caption = message.caption or ""
     tags_list = [t for t in caption.split() if t.startswith("#")]
     
-    # 1. Super-Private Check (#private / #hide)
+    # 1. Super-Private Check
     if "#private" in caption or "#hide" in caption:
         f_msg = await message.forward(chat_id=CHANNEL_4_ID)
         file_id = message.photo[-1].file_id if message.photo else (message.video.file_id if message.video else message.document.file_id)
@@ -159,11 +168,14 @@ async def handle_media_upload(message: types.Message):
         await message.reply("🔒 Super-Private Vault (Channel 4) ထဲသို့ လုံခြုံစွာ သိမ်းဆည်းလိုက်ပါပြီ။")
         return
 
-    # 2. Documents & Contracts
-    is_doc = message.document or any(t in caption for t in ["#စာချုပ်", "#doc", "#နယ်", "#ရွာ"])
-    if is_doc:
+    # Document / Photo Check
+    is_doc_tag = any(t in caption for t in ["#စာချုပ်", "#doc", "#နယ်", "#ရွာ"])
+    is_image_doc = message.document and message.document.mime_type and message.document.mime_type.startswith("image/")
+
+    # 2. Channel 3 (PDFs / Scans tagged with #စာချုပ်)
+    if (message.document and not is_image_doc) or (is_image_doc and is_doc_tag):
         f_msg = await message.forward(chat_id=CHANNEL_3_ID)
-        file_id = message.document.file_id if message.document else (message.photo[-1].file_id if message.photo else message.video.file_id)
+        file_id = message.document.file_id if message.document else message.photo[-1].file_id
         
         res = supabase.table("files").insert({
             "telegram_file_id": file_id,
@@ -184,7 +196,7 @@ async def handle_media_upload(message: types.Message):
         await message.reply("📄 Docs & System Vault (Channel 3) ထဲသို့ သိမ်းဆည်းပြီး Tag တွဲပေးလိုက်ပါပြီ။")
         return
 
-    # 3. Videos
+    # 3. Channel 2 (Videos)
     if message.video:
         f_msg = await message.forward(chat_id=CHANNEL_2_ID)
         supabase.table("files").insert({
@@ -196,14 +208,15 @@ async def handle_media_upload(message: types.Message):
             "year": datetime.now().year,
             "access_level": "SHARED"
         }).execute()
-        await message.reply("🎥 Videos Vault (Channel 2) ထဲသို့ သိမ်းဆည်းလိုက်ပါပြီ။")
+        await message.reply("🎥 Videos Vault (Channel 2) ထဲသို့ မူရင်းအရည်အသွေးအတိုင်း သိမ်းဆည်းလိုက်ပါပြီ။")
         return
 
-    # 4. Standard Photos
-    if message.photo:
+    # 4. Channel 1 (Standard Photos & Uncompressed Images)
+    if message.photo or is_image_doc:
         f_msg = await message.forward(chat_id=CHANNEL_1_ID)
-        photo = message.photo[-1]
-        file_info = await bot.get_file(photo.file_id)
+        file_id = message.document.file_id if is_image_doc else message.photo[-1].file_id
+        
+        file_info = await bot.get_file(file_id)
         file_bytes = await bot.download_file(file_info.file_path)
         img_bytes = file_bytes.read()
 
@@ -212,7 +225,7 @@ async def handle_media_upload(message: types.Message):
         category, person_tag = await analyze_photo_with_gemini(img_bytes)
 
         supabase.table("files").insert({
-            "telegram_file_id": photo.file_id,
+            "telegram_file_id": file_id,
             "telegram_message_id": f_msg.message_id,
             "vault_channel": "CHANNEL_1",
             "file_type": "PHOTO",
@@ -223,14 +236,14 @@ async def handle_media_upload(message: types.Message):
             "person_tag": person_tag,
             "access_level": "SHARED"
         }).execute()
-        await message.reply(f"📷 Photos Vault ထဲသို့ သိမ်းဆည်းပြီးပါပြီ။\n🏷️ AI Category: {category}")
+        await message.reply(f"📷 Photos Vault (Channel 1) ထဲသို့ မူရင်းအတိုင်း သိမ်းဆည်းပြီးပါပြီ။\n🏷️ AI Category: {category}")
 
-# ----------------- HANDLERS: SEARCH & BROWSE -----------------
+# ----------------- DYNAMIC SEARCH UI -----------------
 @dp.message(Command("search"))
 async def search_root_handler(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📷 ဓာတ်ပုံများ", callback_data="search_photos"),
+            InlineKeyboardButton(text="📷 ဓာတ်ပုံများ", callback_data="search_photos_root"),
             InlineKeyboardButton(text="🎥 ဗီဒီယိုများ", callback_data="search_videos")
         ],
         [
@@ -240,13 +253,32 @@ async def search_root_handler(message: types.Message):
     ])
     await message.answer("ရှာဖွေလိုသော အုပ်စုကို ရွေးချယ်ပါ:", reply_markup=kb)
 
-@dp.callback_query(F.data == "search_photos")
-async def search_photos_drilldown(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "search_photos_root")
+async def search_photos_options(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 ခုနှစ်အလိုက် ရှာရန်", callback_data="photo_by_year")],
+        [InlineKeyboardButton(text="🏷️ AI အမျိုးအစားအလိုက် ရှာရန်", callback_data="photo_by_category")],
+        [InlineKeyboardButton(text="⬅️ နောက်သို့", callback_data="back_to_root")]
+    ])
+    await callback.message.edit_text("ဓာတ်ပုံများ ရှာဖွေမည့် ပုံစံကို ရွေးပါ:", reply_markup=kb)
+
+@dp.callback_query(F.data == "photo_by_year")
+async def search_photos_by_year(callback: types.CallbackQuery):
     years_res = supabase.table("files").select("year").eq("vault_channel", "CHANNEL_1").execute()
     years = sorted(list(set(r['year'] for r in years_res.data if r.get('year'))))
     
     kb_buttons = [[InlineKeyboardButton(text=f"📅 {y}", callback_data=f"filter_year_{y}")] for y in years]
-    await callback.message.edit_text("ခုနှစ်အလိုက် ရှာဖွေပါ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+    kb_buttons.append([InlineKeyboardButton(text="⬅️ နောက်သို့", callback_data="search_photos_root")])
+    await callback.message.edit_text("ခုနှစ်အလိုက် ရွေးချယ်ပါ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+
+@dp.callback_query(F.data == "photo_by_category")
+async def search_photos_by_category(callback: types.CallbackQuery):
+    cat_res = supabase.table("files").select("ai_category").eq("vault_channel", "CHANNEL_1").execute()
+    categories = sorted(list(set(r['ai_category'] for r in cat_res.data if r.get('ai_category'))))
+    
+    kb_buttons = [[InlineKeyboardButton(text=f"🏷️ {c}", callback_data=f"filter_cat_{c}")] for c in categories]
+    kb_buttons.append([InlineKeyboardButton(text="⬅️ နောက်သို့", callback_data="search_photos_root")])
+    await callback.message.edit_text("AI အမျိုးအစားအလိုက် ရွေးချယ်ပါ:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
 
 @dp.callback_query(F.data.startswith("filter_year_"))
 async def show_files_by_year(callback: types.CallbackQuery):
@@ -269,6 +301,41 @@ async def show_files_by_year(callback: types.CallbackQuery):
         )
     await callback.answer()
 
+@dp.callback_query(F.data.startswith("filter_cat_"))
+async def show_files_by_category(callback: types.CallbackQuery):
+    cat = callback.data.split("_")[2]
+    res = supabase.table("files").select("*").eq("vault_channel", "CHANNEL_1").eq("ai_category", cat).limit(5).execute()
+    
+    if not res.data:
+        await callback.answer("ဖိုင်မရှိသေးပါခင်ဗျာ။", show_alert=True)
+        return
+        
+    for item in res.data:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬇️ Download Original", callback_data=f"getraw_{item['id']}")]
+        ])
+        await bot.send_photo(
+            chat_id=callback.from_user.id,
+            photo=item['telegram_file_id'],
+            caption=f"🏷️ Category: {item.get('ai_category')} | 📅 Year: {item['year']}",
+            reply_markup=kb
+        )
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_root")
+async def back_to_root_menu(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📷 ဓာတ်ပုံများ", callback_data="search_photos_root"),
+            InlineKeyboardButton(text="🎥 ဗီဒီယိုများ", callback_data="search_videos")
+        ],
+        [
+            InlineKeyboardButton(text="📄 စာချုပ်စာတမ်းများ", callback_data="search_docs"),
+            InlineKeyboardButton(text="🔒 Channel 4 Vault", callback_data="unlock_ch4")
+        ]
+    ])
+    await callback.message.edit_text("ရှာဖွေလိုသော အုပ်စုကို ရွေးချယ်ပါ:", reply_markup=kb)
+
 @dp.callback_query(F.data.startswith("getraw_"))
 async def stream_raw_file(callback: types.CallbackQuery):
     file_uuid = callback.data.split("_")[1]
@@ -283,7 +350,7 @@ async def stream_raw_file(callback: types.CallbackQuery):
         )
     await callback.answer()
 
-# ----------------- HANDLERS: CHANNEL 4 PIN SECURITY -----------------
+# ----------------- CHANNEL 4 & PIN -----------------
 @dp.callback_query(F.data == "unlock_ch4")
 async def prompt_ch4_pin(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("🔒 Super-Private Vault PIN ရိုက်ထည့်ပေးပါ:")
@@ -332,15 +399,22 @@ async def save_new_pin(message: types.Message, state: FSMContext):
     await message.answer("✅ Channel 4 Master PIN အသစ်ကို လုံခြုံစွာ သတ်မှတ်သိမ်းဆည်းလိုက်ပါပြီ။")
     await state.clear()
 
-# ----------------- MAIN RUNNER & DUMMY SERVER -----------------
+# ----------------- WEB SERVER & STARTUP -----------------
 async def handle_ping(request):
-    return web.Response(text="Matthen Vault Bot is alive and running 24/7!")
+    return web.Response(text="Matthen Vault Bot is running 24/7!")
+
+async def set_bot_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="Bot စတင်ရန် / မိတ်ဆက်"),
+        BotCommand(command="search", description="ဖိုင်များ ရှာဖွေရန်"),
+        BotCommand(command="setpin", description="Channel 4 PIN သတ်မှတ်ရန် (Admin)")
+    ]
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
 
 async def main():
     scheduler.add_job(daily_backup_task, "cron", hour=2, minute=0)
     scheduler.start()
 
-    # Render Web Service အတွက် Port နားထောင်ပေးခြင်း
     app = web.Application()
     app.router.add_get("/", handle_ping)
     runner = web.AppRunner(app)
@@ -350,7 +424,8 @@ async def main():
     await site.start()
 
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Matthen Vault Bot is starting...")
+    await set_bot_commands(bot)
+    logger.info("Matthen Vault Bot is fully upgraded and running...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
